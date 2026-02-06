@@ -34,4 +34,4 @@ async def on_ready():
     print("Bot is ready and all commands are removed!")
 
 # Run the bot
-bot.run(MTQ2OTI4MjE1MzgyMDA2MTg5NQ.Gghjb6.HPQH5QjK_VaQlIx4KFsxJl1DJdaIg6WeSDMGyU)
+bot.run(DISCORD_TOKEN)
