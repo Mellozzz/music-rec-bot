@@ -40,4 +40,4 @@ async def leaderboard(interaction: discord.Interaction):
     await interaction.response.send_message(f"Leaderboard goes here! Check <#{MUSIC_CHANNEL_ID}>")
 
 # Run the bot
-bot.run("YOUR_NEW_BOT_TOKEN")  # <-- Use the new token after you reset it
+bot.run("MTQ2OTI4MjE1MzgyMDA2MTg5NQ.Gghjb6.HPQH5QjK_VaQlIx4KFsxJl1DJdaIg6WeSDMGyU")  
