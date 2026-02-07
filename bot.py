@@ -28,106 +28,69 @@ def save_ratings(data):
         json.dump(data, f, indent=4)
 
 # -----------------------------
-# PLATFORM DETECTORS
-# -----------------------------
-
-def is_spotify(url):
-    return "open.spotify.com/track" in url
-
-def is_youtube(url):
-    return "youtube.com" in url or "youtu.be" in url
-
-def is_apple(url):
-    return "music.apple.com" in url
-
-# -----------------------------
 # SCRAPERS
 # -----------------------------
 
-async def scrape_spotify(url):
+async def fetch_json(url):
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as r:
-            html = await r.text()
+            return await r.json(content_type=None)
 
-    title = re.search(r'<meta property="og:title" content="(.*?)"', html)
-    artist = re.search(r'<meta property="og:description" content="(.*?)"', html)
-    image = re.search(r'<meta property="og:image" content="(.*?)"', html)
-
-    return {
-        "title": title.group(1) if title else "Unknown Title",
-        "artist": artist.group(1).split("·")[0] if artist else "Unknown Artist",
-        "image": image.group(1) if image else None,
-        "spotify": url,
-        "apple": None
-    }
-
-async def scrape_apple(url):
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as r:
-            html = await r.text()
-
-    title = re.search(r'<meta property="og:title" content="(.*?)"', html)
-    artist = re.search(r'<meta property="og:description" content="(.*?)"', html)
-    image = re.search(r'<meta property="og:image" content="(.*?)"', html)
-
-    return {
-        "title": title.group(1) if title else "Unknown Title",
-        "artist": artist.group(1) if artist else "Unknown Artist",
-        "image": image.group(1) if image else None,
-        "spotify": None,
-        "apple": url
-    }
-
-async def scrape_youtube(url):
-    api = f"https://www.youtube.com/oembed?url={url}&format=json"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(api) as r:
-            data = await r.json()
-
-    return {
-        "title": data["title"],
-        "artist": data.get("author_name", "Unknown"),
-        "image": data.get("thumbnail_url"),
-        "spotify": None,
-        "apple": None
-    }
-
-async def search_itunes(query):
+async def search_spotify(query):
     api = f"https://itunes.apple.com/search?term={query}&entity=song&limit=1"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(api) as r:
-            data = await r.json(content_type=None)
+    return None  # placeholder if you add Spotify API later
 
+async def search_apple(query):
+    api = f"https://itunes.apple.com/search?term={query}&entity=song&limit=1"
+    data = await fetch_json(api)
     if data["resultCount"] == 0:
         return None
-
     track = data["results"][0]
-
     return {
         "title": track["trackName"],
         "artist": track["artistName"],
         "image": track["artworkUrl100"].replace("100x100", "600x600"),
-        "spotify": None,
         "apple": track["trackViewUrl"]
     }
+
+async def extract_title_from_link(url):
+    if "spotify.com" in url:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as r:
+                html = await r.text()
+        title = re.search(r'<meta property="og:title" content="(.*?)"', html)
+        artist = re.search(r'<meta property="og:description" content="(.*?)"', html)
+        if title and artist:
+            return f"{title.group(1)} {artist.group(1).split('·')[0]}"
+    if "music.apple.com" in url:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as r:
+                html = await r.text()
+        title = re.search(r'<meta property="og:title" content="(.*?)"', html)
+        artist = re.search(r'<meta property="og:description" content="(.*?)"', html)
+        if title and artist:
+            return f"{title.group(1)} {artist.group(1)}"
+    return url
 
 # -----------------------------
 # RATING BUTTONS
 # -----------------------------
 
 class RatingButtons(discord.ui.View):
-    def __init__(self, song_key):
+    def __init__(self, song_key, message):
         super().__init__(timeout=None)
         self.song_key = song_key
+        self.message = message
 
         for i in range(1, 11):
-            self.add_item(RatingButton(i, song_key))
+            self.add_item(RatingButton(i, song_key, message))
 
 class RatingButton(discord.ui.Button):
-    def __init__(self, rating, song_key):
+    def __init__(self, rating, song_key, message):
         super().__init__(label=str(rating), style=discord.ButtonStyle.green)
         self.rating = rating
         self.song_key = song_key
+        self.message = message
 
     async def callback(self, interaction: discord.Interaction):
         user_id = str(interaction.user.id)
@@ -137,9 +100,21 @@ class RatingButton(discord.ui.Button):
             ratings[self.song_key] = {"ratings": {}}
 
         previous = ratings[self.song_key]["ratings"].get(user_id)
-
         ratings[self.song_key]["ratings"][user_id] = self.rating
         save_ratings(ratings)
+
+        # Recalculate average
+        user_ratings = ratings[self.song_key]["ratings"]
+        avg = sum(user_ratings.values()) / len(user_ratings)
+        avg_text = f"{avg:.2f}/10"
+
+        # Update embed
+        embed = self.message.embeds[0]
+        desc = embed.description.split("\n")
+        desc[1] = f"**Average Rating:** {avg_text}"
+        embed.description = "\n".join(desc)
+
+        await self.message.edit(embed=embed, view=self.view)
 
         if previous is None:
             msg = f"You rated **{self.song_key}** a **{self.rating}/10**."
@@ -160,64 +135,53 @@ async def on_ready():
     await bot.tree.sync()
     print(f"Logged in as {bot.user}")
 
-@bot.tree.command(name="recommend", description="Recommend a song (link or name) and let others rate it")
+@bot.tree.command(name="recommend", description="Recommend a song and let others rate it")
 async def recommend(interaction: discord.Interaction, song: str):
     await interaction.response.defer()
 
-    if is_spotify(song):
-        data = await scrape_spotify(song)
-    elif is_youtube(song):
-        data = await scrape_youtube(song)
-    elif is_apple(song):
-        data = await scrape_apple(song)
-    else:
-        data = await search_itunes(song)
-        if not data:
-            return await interaction.followup.send("Couldn't find that song.")
+    query = await extract_title_from_link(song)
+    apple = await search_apple(query)
 
-    song_key = f"{data['title']} - {data['artist']}"
+    if not apple:
+        return await interaction.followup.send("Couldn't find that song.")
+
+    title = apple["title"]
+    artist = apple["artist"]
+    image = apple["image"]
+    apple_link = apple["apple"]
+
+    spotify_link = None  # placeholder until Spotify API is added
+
+    song_key = f"{title} - {artist}"
 
     ratings = load_ratings()
     existing = ratings.get(song_key, {}).get("ratings", {})
-
     avg = sum(existing.values()) / len(existing) if existing else 0
     avg_text = f"{avg:.2f}/10" if existing else "No ratings yet"
-
-    spotify_link = data["spotify"]
-    apple_link = data["apple"]
-
-    if spotify_link:
-        main_url = spotify_link
-    elif apple_link:
-        main_url = apple_link
-    else:
-        main_url = None
 
     links = []
     if spotify_link:
         links.append(f"[Spotify]({spotify_link})")
-    if apple_link:
-        links.append(f"[Apple Music]({apple_link})")
+    links.append(f"[Apple Music]({apple_link})")
 
-    link_text = " • ".join(links) if links else "No links available"
+    link_text = " • ".join(links)
 
     embed = discord.Embed(
-        title=data["title"],
-        url=main_url,
+        title=title,
+        url=spotify_link or apple_link,
         description=(
-            f"**Artist:** {data['artist']}\n"
+            f"**Artist:** {artist}\n"
             f"**Average Rating:** {avg_text}\n\n"
             f"{link_text}"
         ),
         color=0x1DB954
     )
 
-    if data["image"]:
-        embed.set_image(url=data["image"])
+    embed.set_image(url=image)
 
-    view = RatingButtons(song_key)
-
-    await interaction.followup.send(embed=embed, view=view)
+    msg = await interaction.followup.send(embed=embed)
+    view = RatingButtons(song_key, msg)
+    await msg.edit(view=view)
 
 @bot.tree.command(name="leaderboard", description="Show the top-rated songs")
 async def leaderboard(interaction: discord.Interaction):
@@ -231,16 +195,12 @@ async def leaderboard(interaction: discord.Interaction):
         user_ratings = data.get("ratings", {})
         if not user_ratings:
             continue
-
         avg = sum(user_ratings.values()) / len(user_ratings)
         scored.append((song, avg, len(user_ratings)))
 
     scored.sort(key=lambda x: x[1], reverse=True)
 
-    embed = discord.Embed(
-        title="🎵 Top Rated Songs",
-        color=0xFFD700
-    )
+    embed = discord.Embed(title="Top Rated Songs", color=0xFFD700)
 
     for i, (song, avg, count) in enumerate(scored[:10], start=1):
         embed.add_field(
@@ -259,9 +219,8 @@ async def myratings(interaction: discord.Interaction):
     user_songs = []
 
     for song, data in ratings.items():
-        user_rating = data.get("ratings", {}).get(user_id)
-        if user_rating is not None:
-            user_songs.append((song, user_rating))
+        if user_id in data.get("ratings", {}):
+            user_songs.append((song, data["ratings"][user_id]))
 
     if not user_songs:
         return await interaction.response.send_message(
@@ -275,11 +234,7 @@ async def myratings(interaction: discord.Interaction):
     )
 
     for song, rating in user_songs:
-        embed.add_field(
-            name=song,
-            value=f"Your rating: **{rating}/10**",
-            inline=False
-        )
+        embed.add_field(name=song, value=f"Your rating: **{rating}/10**", inline=False)
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
