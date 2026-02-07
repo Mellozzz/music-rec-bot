@@ -106,12 +106,12 @@ def ytm_search_html(query: str) -> Optional[str]:
 
 
 def extract_ytm_title_artist(html: str) -> Optional[Tuple[str, str]]:
-    title_match = re.search(r'"title":{"runs":
+    title_match = re.search(r"\"title\":\{\"runs\":
 
-\[{"text":"([^"]+)"}', html)
-    artist_match = re.search(r'"artist":{"runs":
+\[\{\"text\":\"([^\"]+)\"", html)
+    artist_match = re.search(r"\"artist\":\{\"runs\":
 
-\[{"text":"([^"]+)"}', html)
+\[\{\"text\":\"([^\"]+)\"", html)
     if not title_match or not artist_match:
         return None
     return title_match.group(1), artist_match.group(1)
@@ -271,7 +271,7 @@ def save_ratings(data: Dict[str, Any]) -> None:
 def load_views() -> Dict[str, Any]:
     data = load_json(VIEWS_FILE)
     if not isinstance(data, dict):
-        return {}
+        data = {}
     if "messages" not in data or not isinstance(data["messages"], list):
         data["messages"] = []
     return data
@@ -406,27 +406,23 @@ async def restore_persistent_views() -> None:
                 continue
             try:
                 await channel.fetch_message(message_id)
-            except discord.Forbidden as e:
-                print(f"Permission error fetching message {message_id}: {e}")
+            except discord.Forbidden:
                 continue
-            except discord.HTTPException as e:
-                print(f"HTTP error fetching message {message_id}: {e}")
+            except discord.HTTPException:
                 continue
             view = RatingView(song_key=song_key, timeout=None)
             bot.add_view(view, message_id=message_id)
-        except Exception as e:
-            print(f"Error restoring view: {e}")
+        except Exception:
+            pass
 
 
 @bot.event
 async def on_ready() -> None:
     try:
-        synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} command(s).")
-    except Exception as e:
-        print(f"Error syncing commands: {e}")
+        await bot.tree.sync()
+    except Exception:
+        pass
     bot.loop.create_task(restore_persistent_views())
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
 
 @bot.tree.command(name="recommend", description="Recommend a song by name or link.")
@@ -501,3 +497,18 @@ async def myratings(interaction: discord.Interaction) -> None:
         await interaction.followup.send(
             "You haven't rated any songs yet.", ephemeral=True
         )
+        return
+    lines: List[str] = []
+    for _, song in entries[:20]:
+        title = song.get("title", "Unknown")
+        artist = song.get("artist", "Unknown")
+        spotify_url = song.get("spotify_url", "")
+        song_ratings = song.get("ratings", {})
+        avg, count = compute_average_and_count(song_ratings)
+        user_rating = song_ratings.get(user_id, 0)
+        line = (
+            f"**{title}** — {artist}\n"
+            f"Your rating: {user_rating}/5 | Avg: {avg:.2f}/5 ({count})\n"
+            f"{spotify_url}"
+        )
+        lines.append(line)
