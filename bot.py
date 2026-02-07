@@ -14,10 +14,9 @@ import requests
 RATINGS_FILE: str = "ratings.json"
 VIEWS_FILE: str = "views.json"
 
-DUCKDUCKGO_PRIMARY: str = "https://duckduckgo.com/html/"
-DUCKDUCKGO_FALLBACK: str = "https://html.duckduckgo.com/html/"
 SPOTIFY_OEMBED_URL: str = "https://open.spotify.com/oembed"
 APPLE_MUSIC_DOMAIN: str = "music.apple.com"
+BING_SEARCH_URL: str = "https://www.bing.com/search"
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -91,16 +90,13 @@ def extract_query_from_input(user_input: str) -> str:
     return user_input
 
 
-def duckduckgo_search_html(query: str) -> Optional[str]:
-    params = {"q": query}
+def bing_search_html(query: str) -> Optional[str]:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    params = {"q": query, "mkt": "en-US"}
     try:
-        resp = requests.post(DUCKDUCKGO_PRIMARY, data=params, timeout=10)
-        if resp.status_code == 200 and resp.text:
-            return resp.text
-    except Exception:
-        pass
-    try:
-        resp = requests.post(DUCKDUCKGO_FALLBACK, data=params, timeout=10)
+        resp = requests.get(BING_SEARCH_URL, params=params, headers=headers, timeout=10)
         if resp.status_code == 200 and resp.text:
             return resp.text
     except Exception:
@@ -108,28 +104,55 @@ def duckduckgo_search_html(query: str) -> Optional[str]:
     return None
 
 
+def extract_b_algo_blocks(html: str) -> List[str]:
+    blocks: List[str] = []
+    pattern = re.compile(r'<li class="b_algo".*?</li>', re.DOTALL)
+    for match in pattern.finditer(html):
+        blocks.append(match.group(0))
+    return blocks
+
+
 def extract_spotify_track_urls_from_html(html: str) -> List[str]:
-    pattern = r"https?://open\.spotify\.com/track/[a-zA-Z0-9]+"
-    urls = re.findall(pattern, html)
+    blocks = extract_b_algo_blocks(html)
+    urls: List[str] = []
     seen = set()
-    result: List[str] = []
-    for u in urls:
-        if u not in seen:
-            seen.add(u)
-            result.append(u)
-    return result
+    for block in blocks:
+        for m in re.finditer(r'https?://open\.spotify\.com/track/[a-zA-Z0-9]+', block):
+            url = m.group(0)
+            if url not in seen:
+                seen.add(url)
+                urls.append(url)
+    if not urls:
+        for m in re.finditer(r'https?://open\.spotify\.com/track/[a-zA-Z0-9]+', html):
+            url = m.group(0)
+            if url not in seen:
+                seen.add(url)
+                urls.append(url)
+    return urls
 
 
 def extract_apple_music_track_urls_from_html(html: str) -> List[str]:
-    pattern = r"https?://music\.apple\.com/[^\s\"']+"
-    urls = re.findall(pattern, html)
-    track_urls: List[str] = []
-    for u in urls:
-        if "/album/" in u or "/playlist/" in u:
-            continue
-        if u not in track_urls:
-            track_urls.append(u)
-    return track_urls
+    blocks = extract_b_algo_blocks(html)
+    urls: List[str] = []
+    seen = set()
+    pattern = re.compile(r'https?://music\.apple\.com/[^\s"\'<>]+')
+    for block in blocks:
+        for m in pattern.finditer(block):
+            url = m.group(0)
+            if "/album/" in url or "/playlist/" in url:
+                continue
+            if url not in seen:
+                seen.add(url)
+                urls.append(url)
+    if not urls:
+        for m in pattern.finditer(html):
+            url = m.group(0)
+            if "/album/" in url or "/playlist/" in url:
+                continue
+            if url not in seen:
+                seen.add(url)
+                urls.append(url)
+    return urls
 
 
 def spotify_oembed_metadata(url: str) -> Optional[Dict[str, Any]]:
@@ -164,19 +187,18 @@ def simplify_query(query: str) -> str:
 
 
 def find_best_spotify_track(query: str) -> Optional[Dict[str, Any]]:
-    html = duckduckgo_search_html(query)
-print("HTML length:", len(html) if html else "None")
+    html = bing_search_html(query)
     if html is None:
         simplified = simplify_query(query)
         if simplified != query:
-            html = duckduckgo_search_html(simplified)
+            html = bing_search_html(simplified)
     if html is None:
         return None
     urls = extract_spotify_track_urls_from_html(html)
     if not urls:
         simplified = simplify_query(query)
         if simplified != query:
-            html2 = duckduckgo_search_html(simplified)
+            html2 = bing_search_html(simplified)
             if html2:
                 urls = extract_spotify_track_urls_from_html(html2)
     if not urls:
@@ -208,14 +230,14 @@ print("HTML length:", len(html) if html else "None")
 
 
 def find_apple_music_track(query: str) -> Optional[str]:
-    html = duckduckgo_search_html(f"{query} site:{APPLE_MUSIC_DOMAIN}")
+    html = bing_search_html(f"{query} site:{APPLE_MUSIC_DOMAIN}")
     if html is None:
         return None
     urls = extract_apple_music_track_urls_from_html(html)
     if not urls:
         simplified = simplify_query(query)
         if simplified != query:
-            html2 = duckduckgo_search_html(f"{simplified} site:{APPLE_MUSIC_DOMAIN}")
+            html2 = bing_search_html(f"{simplified} site:{APPLE_MUSIC_DOMAIN}")
             if html2:
                 urls = extract_apple_music_track_urls_from_html(html2)
     if not urls:
