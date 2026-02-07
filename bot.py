@@ -28,7 +28,7 @@ def save_ratings(data):
         json.dump(data, f, indent=4)
 
 # -----------------------------
-# SCRAPERS
+# HELPERS
 # -----------------------------
 
 async def fetch_json(url):
@@ -36,41 +36,78 @@ async def fetch_json(url):
         async with session.get(url) as r:
             return await r.json(content_type=None)
 
-async def search_spotify(query):
-    api = f"https://itunes.apple.com/search?term={query}&entity=song&limit=1"
-    return None  # placeholder if you add Spotify API later
+async def fetch_text(url):
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as r:
+            return await r.text()
 
-async def search_apple(query):
-    api = f"https://itunes.apple.com/search?term={query}&entity=song&limit=1"
-    data = await fetch_json(api)
-    if data["resultCount"] == 0:
-        return None
-    track = data["results"][0]
-    return {
-        "title": track["trackName"],
-        "artist": track["artistName"],
-        "image": track["artworkUrl100"].replace("100x100", "600x600"),
-        "apple": track["trackViewUrl"]
-    }
+# -----------------------------
+# QUERY EXTRACTION (HYBRID)
+# -----------------------------
 
 async def extract_title_from_link(url):
     if "spotify.com" in url:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as r:
-                html = await r.text()
+        html = await fetch_text(url)
         title = re.search(r'<meta property="og:title" content="(.*?)"', html)
         artist = re.search(r'<meta property="og:description" content="(.*?)"', html)
         if title and artist:
             return f"{title.group(1)} {artist.group(1).split('·')[0]}"
+
     if "music.apple.com" in url:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as r:
-                html = await r.text()
+        html = await fetch_text(url)
         title = re.search(r'<meta property="og:title" content="(.*?)"', html)
         artist = re.search(r'<meta property="og:description" content="(.*?)"', html)
         if title and artist:
             return f"{title.group(1)} {artist.group(1)}"
+
+    if "youtube.com" in url or "youtu.be" in url:
+        api = f"https://www.youtube.com/oembed?url={url}&format=json"
+        data = await fetch_json(api)
+        return data.get("title")
+
     return url
+
+# -----------------------------
+# JIOSAAVN SEARCH (GLOBAL REGION)
+# RETURNS SPOTIFY + APPLE LINKS
+# -----------------------------
+
+async def search_jiosaavn(query):
+    api = f"https://www.jiosaavn.com/api.php?__call=autocomplete.get&query={query.replace(' ', '%20')}&_format=json&_marker=0"
+    data = await fetch_json(api)
+
+    if "songs" not in data or "data" not in data["songs"]:
+        return None
+
+    songs = data["songs"]["data"]
+    if not songs:
+        return None
+
+    # pick highest popularity
+    songs.sort(key=lambda x: int(x.get("more_info", {}).get("votecount", 0)), reverse=True)
+    best = songs[0]
+
+    info = best.get("more_info", {})
+
+    spotify_id = info.get("spotify_id")
+    apple_url = info.get("itunes_url")
+
+    if not spotify_id:
+        return None  # Spotify required
+
+    spotify_link = f"https://open.spotify.com/track/{spotify_id}"
+
+    title = best.get("title")
+    artist = best.get("subtitle")
+    image = info.get("image_url")
+
+    return {
+        "title": title,
+        "artist": artist,
+        "image": image,
+        "spotify": spotify_link,
+        "apple": apple_url
+    }
 
 # -----------------------------
 # RATING BUTTONS
@@ -103,12 +140,10 @@ class RatingButton(discord.ui.Button):
         ratings[self.song_key]["ratings"][user_id] = self.rating
         save_ratings(ratings)
 
-        # Recalculate average
         user_ratings = ratings[self.song_key]["ratings"]
         avg = sum(user_ratings.values()) / len(user_ratings)
         avg_text = f"{avg:.2f}/10"
 
-        # Update embed
         embed = self.message.embeds[0]
         desc = embed.description.split("\n")
         desc[1] = f"**Average Rating:** {avg_text}"
@@ -119,10 +154,7 @@ class RatingButton(discord.ui.Button):
         if previous is None:
             msg = f"You rated **{self.song_key}** a **{self.rating}/10**."
         else:
-            msg = (
-                f"You changed your rating for **{self.song_key}** "
-                f"from **{previous}/10** to **{self.rating}/10**."
-            )
+            msg = f"You changed your rating for **{self.song_key}** from **{previous}/10** to **{self.rating}/10**."
 
         await interaction.response.send_message(msg, ephemeral=True)
 
@@ -140,17 +172,16 @@ async def recommend(interaction: discord.Interaction, song: str):
     await interaction.response.defer()
 
     query = await extract_title_from_link(song)
-    apple = await search_apple(query)
+    data = await search_jiosaavn(query)
 
-    if not apple:
-        return await interaction.followup.send("Couldn't find that song.")
+    if not data:
+        return await interaction.followup.send("This song is not available on Spotify.")
 
-    title = apple["title"]
-    artist = apple["artist"]
-    image = apple["image"]
-    apple_link = apple["apple"]
-
-    spotify_link = None  # placeholder until Spotify API is added
+    title = data["title"]
+    artist = data["artist"]
+    image = data["image"]
+    spotify_link = data["spotify"]
+    apple_link = data["apple"]
 
     song_key = f"{title} - {artist}"
 
@@ -159,16 +190,15 @@ async def recommend(interaction: discord.Interaction, song: str):
     avg = sum(existing.values()) / len(existing) if existing else 0
     avg_text = f"{avg:.2f}/10" if existing else "No ratings yet"
 
-    links = []
-    if spotify_link:
-        links.append(f"[Spotify]({spotify_link})")
-    links.append(f"[Apple Music]({apple_link})")
+    links = [f"[Spotify]({spotify_link})"]
+    if apple_link:
+        links.append(f"[Apple Music]({apple_link})")
 
     link_text = " • ".join(links)
 
     embed = discord.Embed(
         title=title,
-        url=spotify_link or apple_link,
+        url=spotify_link,
         description=(
             f"**Artist:** {artist}\n"
             f"**Average Rating:** {avg_text}\n\n"
@@ -177,7 +207,8 @@ async def recommend(interaction: discord.Interaction, song: str):
         color=0x1DB954
     )
 
-    embed.set_image(url=image)
+    if image:
+        embed.set_image(url=image)
 
     msg = await interaction.followup.send(embed=embed)
     view = RatingButtons(song_key, msg)
