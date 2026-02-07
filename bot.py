@@ -183,22 +183,37 @@ async def recommend(interaction: discord.Interaction, song: str):
     avg = sum(existing.values()) / len(existing) if existing else 0
     avg_text = f"{avg:.2f}/10" if existing else "No ratings yet"
 
+    spotify_link = data["spotify"]
+    apple_link = data["apple"]
+
+    if spotify_link:
+        main_url = spotify_link
+    elif apple_link:
+        main_url = apple_link
+    else:
+        main_url = None
+
     links = []
-    if data["spotify"]:
-        links.append(f"[Spotify]({data['spotify']})")
-    if data["apple"]:
-        links.append(f"[Apple Music]({data['apple']})")
+    if spotify_link:
+        links.append(f"[Spotify]({spotify_link})")
+    if apple_link:
+        links.append(f"[Apple Music]({apple_link})")
 
     link_text = " • ".join(links) if links else "No links available"
 
     embed = discord.Embed(
         title=data["title"],
-        description=f"**Artist:** {data['artist']}\n**Average Rating:** {avg_text}\n\n{link_text}",
+        url=main_url,
+        description=(
+            f"**Artist:** {data['artist']}\n"
+            f"**Average Rating:** {avg_text}\n\n"
+            f"{link_text}"
+        ),
         color=0x1DB954
     )
 
     if data["image"]:
-        embed.set_thumbnail(url=data["image"])
+        embed.set_image(url=data["image"])
 
     view = RatingButtons(song_key)
 
