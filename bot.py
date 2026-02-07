@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import sys
 import asyncio
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -10,8 +11,6 @@ from discord.ext import commands
 
 import requests
 
-TOKEN: str = "YOUR_TOKEN_HERE"
-
 RATINGS_FILE: str = "ratings.json"
 VIEWS_FILE: str = "views.json"
 
@@ -20,10 +19,10 @@ DUCKDUCKGO_FALLBACK: str = "https://html.duckduckgo.com/html/"
 SPOTIFY_OEMBED_URL: str = "https://open.spotify.com/oembed"
 APPLE_MUSIC_DOMAIN: str = "music.apple.com"
 
-INTENTS = discord.Intents.default()
-INTENTS.message_content = True
+intents = discord.Intents.default()
+intents.message_content = True
 
-bot = commands.Bot(command_prefix="!", intents=INTENTS)
+bot = commands.Bot(command_prefix="!", intents=intents)
 
 
 def load_json(path: str) -> Any:
@@ -150,13 +149,18 @@ def parse_spotify_title_and_artist(oembed_data: Dict[str, Any]) -> Tuple[str, st
     return title, author
 
 
-def score_spotify_candidate(
-    query: str, title: str, artist: str
-) -> Tuple[int, bool]:
+def score_spotify_candidate(query: str, title: str, artist: str) -> Tuple[int, bool]:
     full = f"{title} {artist}".strip()
     ratio = simple_fuzzy_ratio(query, full)
     unwanted = contains_unwanted_version(title)
     return ratio, unwanted
+
+
+def simplify_query(query: str) -> str:
+    parts = query.split()
+    if len(parts) <= 1:
+        return query
+    return " ".join(parts[:-1])
 
 
 def find_best_spotify_track(query: str) -> Optional[Dict[str, Any]]:
@@ -200,13 +204,6 @@ def find_best_spotify_track(query: str) -> Optional[Dict[str, Any]]:
     if best_score < 50:
         return None
     return best_data
-
-
-def simplify_query(query: str) -> str:
-    parts = query.split()
-    if len(parts) <= 1:
-        return query
-    return " ".join(parts[:-1])
 
 
 def find_apple_music_track(query: str) -> Optional[str]:
@@ -466,7 +463,9 @@ async def myratings(interaction: discord.Interaction) -> None:
         if user_id in song_ratings:
             entries.append((song_key, song))
     if not entries:
-        await interaction.followup.send("You haven't rated any songs yet.", ephemeral=True)
+        await interaction.followup.send(
+            "You haven't rated any songs yet.", ephemeral=True
+        )
         return
     lines: List[str] = []
     for _, song in entries[:20]:
@@ -476,7 +475,11 @@ async def myratings(interaction: discord.Interaction) -> None:
         song_ratings = song.get("ratings", {})
         avg, count = compute_average_and_count(song_ratings)
         user_rating = song_ratings.get(user_id, 0)
-        line = f"**{title}** — {artist}\nYour rating: {user_rating}/5 | Avg: {avg:.2f}/5 ({count})\n{spotify_url}"
+        line = (
+            f"**{title}** — {artist}\n"
+            f"Your rating: {user_rating}/5 | Avg: {avg:.2f}/5 ({count})\n"
+            f"{spotify_url}"
+        )
         lines.append(line)
     desc = "\n\n".join(lines)
     embed = discord.Embed(
@@ -507,7 +510,11 @@ async def leaderboard(interaction: discord.Interaction) -> None:
         title = song.get("title", "Unknown")
         artist = song.get("artist", "Unknown")
         spotify_url = song.get("spotify_url", "")
-        line = f"**#{idx}** — **{title}** — {artist}\nAvg: {avg:.2f}/5 ({count})\n{spotify_url}"
+        line = (
+            f"**#{idx}** — **{title}** — {artist}\n"
+            f"Avg: {avg:.2f}/5 ({count})\n"
+            f"{spotify_url}"
+        )
         lines.append(line)
     desc = "\n\n".join(lines)
     embed = discord.Embed(
@@ -519,4 +526,8 @@ async def leaderboard(interaction: discord.Interaction) -> None:
 
 
 if __name__ == "__main__":
-    bot.run(TOKEN)
+    token = os.getenv("DISCORD_TOKEN") or os.getenv("TOKEN")
+    if not token:
+        print("No DISCORD_TOKEN or TOKEN environment variable found. Exiting.")
+        sys.exit(1)
+    bot.run(token)
