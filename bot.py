@@ -57,7 +57,25 @@ async def scrape_spotify(url):
         "title": title.group(1) if title else "Unknown Title",
         "artist": artist.group(1).split("·")[0] if artist else "Unknown Artist",
         "image": image.group(1) if image else None,
-        "url": url
+        "spotify": url,
+        "apple": None
+    }
+
+async def scrape_apple(url):
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as r:
+            html = await r.text()
+
+    title = re.search(r'<meta property="og:title" content="(.*?)"', html)
+    artist = re.search(r'<meta property="og:description" content="(.*?)"', html)
+    image = re.search(r'<meta property="og:image" content="(.*?)"', html)
+
+    return {
+        "title": title.group(1) if title else "Unknown Title",
+        "artist": artist.group(1) if artist else "Unknown Artist",
+        "image": image.group(1) if image else None,
+        "spotify": None,
+        "apple": url
     }
 
 async def scrape_youtube(url):
@@ -70,7 +88,8 @@ async def scrape_youtube(url):
         "title": data["title"],
         "artist": data.get("author_name", "Unknown"),
         "image": data.get("thumbnail_url"),
-        "url": url
+        "spotify": None,
+        "apple": None
     }
 
 async def search_itunes(query):
@@ -88,7 +107,8 @@ async def search_itunes(query):
         "title": track["trackName"],
         "artist": track["artistName"],
         "image": track["artworkUrl100"].replace("100x100", "600x600"),
-        "url": track["trackViewUrl"]
+        "spotify": None,
+        "apple": track["trackViewUrl"]
     }
 
 # -----------------------------
@@ -116,13 +136,20 @@ class RatingButton(discord.ui.Button):
         if self.song_key not in ratings:
             ratings[self.song_key] = {"ratings": {}}
 
+        previous = ratings[self.song_key]["ratings"].get(user_id)
+
         ratings[self.song_key]["ratings"][user_id] = self.rating
         save_ratings(ratings)
 
-        await interaction.response.send_message(
-            f"You rated **{self.song_key}** a **{self.rating}/10**.",
-            ephemeral=True
-        )
+        if previous is None:
+            msg = f"You rated **{self.song_key}** a **{self.rating}/10**."
+        else:
+            msg = (
+                f"You changed your rating for **{self.song_key}** "
+                f"from **{previous}/10** to **{self.rating}/10**."
+            )
+
+        await interaction.response.send_message(msg, ephemeral=True)
 
 # -----------------------------
 # SLASH COMMANDS
@@ -142,7 +169,7 @@ async def recommend(interaction: discord.Interaction, song: str):
     elif is_youtube(song):
         data = await scrape_youtube(song)
     elif is_apple(song):
-        data = await scrape_spotify(song)
+        data = await scrape_apple(song)
     else:
         data = await search_itunes(song)
         if not data:
@@ -150,12 +177,26 @@ async def recommend(interaction: discord.Interaction, song: str):
 
     song_key = f"{data['title']} - {data['artist']}"
 
+    ratings = load_ratings()
+    existing = ratings.get(song_key, {}).get("ratings", {})
+
+    avg = sum(existing.values()) / len(existing) if existing else 0
+    avg_text = f"{avg:.2f}/10" if existing else "No ratings yet"
+
+    links = []
+    if data["spotify"]:
+        links.append(f"[Spotify]({data['spotify']})")
+    if data["apple"]:
+        links.append(f"[Apple Music]({data['apple']})")
+
+    link_text = " • ".join(links) if links else "No links available"
+
     embed = discord.Embed(
         title=data["title"],
-        url=data["url"],
-        description=f"**Artist:** {data['artist']}\n\nRate this song below!",
+        description=f"**Artist:** {data['artist']}\n**Average Rating:** {avg_text}\n\n{link_text}",
         color=0x1DB954
     )
+
     if data["image"]:
         embed.set_thumbnail(url=data["image"])
 
