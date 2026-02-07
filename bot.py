@@ -165,6 +165,7 @@ def simplify_query(query: str) -> str:
 
 def find_best_spotify_track(query: str) -> Optional[Dict[str, Any]]:
     html = duckduckgo_search_html(query)
+print("HTML length:", len(html) if html else "None")
     if html is None:
         simplified = simplify_query(query)
         if simplified != query:
