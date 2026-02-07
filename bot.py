@@ -17,6 +17,7 @@ VIEWS_FILE: str = "views.json"
 SPOTIFY_OEMBED_URL: str = "https://open.spotify.com/oembed"
 APPLE_MUSIC_DOMAIN: str = "music.apple.com"
 BING_SEARCH_URL: str = "https://www.bing.com/search"
+YTM_SEARCH_URL: str = "https://music.youtube.com/search"
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -88,6 +89,32 @@ def extract_query_from_input(user_input: str) -> str:
         if slug:
             return slug
     return user_input
+
+
+def ytm_search_html(query: str) -> Optional[str]:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    params = {"q": query}
+    try:
+        resp = requests.get(YTM_SEARCH_URL, params=params, headers=headers, timeout=10)
+        if resp.status_code == 200 and resp.text:
+            return resp.text
+    except Exception:
+        pass
+    return None
+
+
+def extract_ytm_title_artist(html: str) -> Optional[Tuple[str, str]]:
+    title_match = re.search(r'"title":{"runs":
+
+\[{"text":"([^"]+)"}', html)
+    artist_match = re.search(r'"artist":{"runs":
+
+\[{"text":"([^"]+)"}', html)
+    if not title_match or not artist_match:
+        return None
+    return title_match.group(1), artist_match.group(1)
 
 
 def bing_search_html(query: str) -> Optional[str]:
@@ -179,28 +206,19 @@ def score_spotify_candidate(query: str, title: str, artist: str) -> Tuple[int, b
     return ratio, unwanted
 
 
-def simplify_query(query: str) -> str:
-    parts = query.split()
-    if len(parts) <= 1:
-        return query
-    return " ".join(parts[:-1])
-
-
 def find_best_spotify_track(query: str) -> Optional[Dict[str, Any]]:
-    html = bing_search_html(query)
-    if html is None:
-        simplified = simplify_query(query)
-        if simplified != query:
-            html = bing_search_html(simplified)
+    ytm_html = ytm_search_html(query)
+    if not ytm_html:
+        return None
+    parsed = extract_ytm_title_artist(ytm_html)
+    if not parsed:
+        return None
+    ytm_title, ytm_artist = parsed
+    search_phrase = f"{ytm_title} {ytm_artist}"
+    html = bing_search_html(f"{search_phrase} site:open.spotify.com/track")
     if html is None:
         return None
     urls = extract_spotify_track_urls_from_html(html)
-    if not urls:
-        simplified = simplify_query(query)
-        if simplified != query:
-            html2 = bing_search_html(simplified)
-            if html2:
-                urls = extract_spotify_track_urls_from_html(html2)
     if not urls:
         return None
     best_data: Optional[Dict[str, Any]] = None
@@ -210,7 +228,7 @@ def find_best_spotify_track(query: str) -> Optional[Dict[str, Any]]:
         if not meta:
             continue
         title, artist = parse_spotify_title_and_artist(meta)
-        score, unwanted = score_spotify_candidate(query, title, artist)
+        score, unwanted = score_spotify_candidate(search_phrase, title, artist)
         if unwanted:
             continue
         if score > best_score:
@@ -234,12 +252,6 @@ def find_apple_music_track(query: str) -> Optional[str]:
     if html is None:
         return None
     urls = extract_apple_music_track_urls_from_html(html)
-    if not urls:
-        simplified = simplify_query(query)
-        if simplified != query:
-            html2 = bing_search_html(f"{simplified} site:{APPLE_MUSIC_DOMAIN}")
-            if html2:
-                urls = extract_apple_music_track_urls_from_html(html2)
     if not urls:
         return None
     return urls[0]
@@ -489,68 +501,3 @@ async def myratings(interaction: discord.Interaction) -> None:
         await interaction.followup.send(
             "You haven't rated any songs yet.", ephemeral=True
         )
-        return
-    lines: List[str] = []
-    for _, song in entries[:20]:
-        title = song.get("title", "Unknown")
-        artist = song.get("artist", "Unknown")
-        spotify_url = song.get("spotify_url", "")
-        song_ratings = song.get("ratings", {})
-        avg, count = compute_average_and_count(song_ratings)
-        user_rating = song_ratings.get(user_id, 0)
-        line = (
-            f"**{title}** — {artist}\n"
-            f"Your rating: {user_rating}/5 | Avg: {avg:.2f}/5 ({count})\n"
-            f"{spotify_url}"
-        )
-        lines.append(line)
-    desc = "\n\n".join(lines)
-    embed = discord.Embed(
-        title="Your Ratings",
-        description=desc,
-        color=0x1DB954,
-    )
-    await interaction.followup.send(embed=embed, ephemeral=True)
-
-
-@bot.tree.command(name="leaderboard", description="Show top rated songs.")
-async def leaderboard(interaction: discord.Interaction) -> None:
-    await interaction.response.defer()
-    ratings_data = load_ratings()
-    scored: List[Tuple[float, int, Dict[str, Any]]] = []
-    for _, song in ratings_data.items():
-        song_ratings = song.get("ratings", {})
-        avg, count = compute_average_and_count(song_ratings)
-        if count == 0:
-            continue
-        scored.append((avg, count, song))
-    if not scored:
-        await interaction.followup.send("No rated songs yet.")
-        return
-    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    lines: List[str] = []
-    for idx, (avg, count, song) in enumerate(scored[:10], start=1):
-        title = song.get("title", "Unknown")
-        artist = song.get("artist", "Unknown")
-        spotify_url = song.get("spotify_url", "")
-        line = (
-            f"**#{idx}** — **{title}** — {artist}\n"
-            f"Avg: {avg:.2f}/5 ({count})\n"
-            f"{spotify_url}"
-        )
-        lines.append(line)
-    desc = "\n\n".join(lines)
-    embed = discord.Embed(
-        title="Top Rated Songs",
-        description=desc,
-        color=0x1DB954,
-    )
-    await interaction.followup.send(embed=embed)
-
-
-if __name__ == "__main__":
-    token = os.getenv("DISCORD_TOKEN") or os.getenv("TOKEN")
-    if not token:
-        print("No DISCORD_TOKEN or TOKEN environment variable found. Exiting.")
-        sys.exit(1)
-    bot.run(token)
