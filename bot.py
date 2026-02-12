@@ -3,6 +3,7 @@ import re
 import json
 import sys
 import asyncio
+import base64
 from typing import Any, Dict, List, Optional, Tuple
 from html import unescape
 
@@ -10,339 +11,305 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+import asyncpg
 import requests
 
-RATINGS_FILE: str = "ratings.json"
-VIEWS_FILE: str = "views.json"
+# ============================================================
+# CONFIG
+# ============================================================
 
-SPOTIFY_OEMBED_URL: str = "https://open.spotify.com/oembed"
-APPLE_MUSIC_DOMAIN: str = "music.apple.com"
-BING_SEARCH_URL: str = "https://www.bing.com/search"
+SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
+SPOTIFY_SEARCH_URL = "https://api.spotify.com/v1/search"
+APPLE_MUSIC_DOMAIN = "music.apple.com"
+BING_SEARCH_URL = "https://www.bing.com/search"
 
 intents = discord.Intents.default()
 intents.message_content = True
-
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+db_pool: Optional[asyncpg.pool.Pool] = None
 
-def load_json(path: str) -> Any:
-    if not os.path.exists(path):
-        return {}
-    with open(path, "r", encoding="utf-8") as f:
+
+# ============================================================
+# DATABASE INITIALIZATION
+# ============================================================
+
+async def init_db():
+    global db_pool
+    db_pool = await asyncpg.create_pool(
+        host=os.getenv("PGHOST"),
+        port=os.getenv("PGPORT"),
+        user=os.getenv("PGUSER"),
+        password=os.getenv("PGPASSWORD"),
+        database=os.getenv("PGDATABASE"),
+        min_size=1,
+        max_size=5,
+    )
+
+    async with db_pool.acquire() as conn:
         try:
-            return json.load(f)
-        except json.JSONDecodeError:
-            return {}
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS songs (
+                    song_key TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    artist TEXT NOT NULL,
+                    spotify_url TEXT NOT NULL,
+                    apple_url TEXT,
+                    average FLOAT DEFAULT 0,
+                    count INT DEFAULT 0
+                );
+            """)
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS ratings (
+                    song_key TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    rating INT NOT NULL,
+                    PRIMARY KEY (song_key, user_id)
+                );
+            """)
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS views (
+                    channel_id BIGINT NOT NULL,
+                    message_id BIGINT NOT NULL,
+                    song_key TEXT NOT NULL
+                );
+            """)
+
+        except Exception as e:
+            print("DB INIT ERROR:", e)
 
 
-def save_json(path: str, data: Any) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+# ============================================================
+# SPOTIFY AUTH (REFRESH TOKEN)
+# ============================================================
+
+def get_spotify_access_token() -> Optional[str]:
+    client_id = os.getenv("SPOTIFY_CLIENT_ID")
+    client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
+    refresh_token = os.getenv("SPOTIFY_REFRESH_TOKEN")
+
+    if not all([client_id, client_secret, refresh_token]):
+        print("Missing Spotify environment variables.")
+        return None
+
+    auth_header = f"{client_id}:{client_secret}".encode("utf-8")
+    auth_b64 = base64.b64encode(auth_header).decode()
+
+    try:
+        resp = requests.post(
+            SPOTIFY_TOKEN_URL,
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+            },
+            headers={
+                "Authorization": f"Basic {auth_b64}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            print("Spotify token refresh failed:", resp.status_code, resp.text)
+            return None
+
+        return resp.json().get("access_token")
+
+    except Exception as e:
+        print("Spotify token error:", e)
+        return None
 
 
-def normalize_text(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip().lower()
+# ============================================================
+# SPOTIFY SEARCH (OFFICIAL API)
+# ============================================================
+
+def spotify_search_track(query: str) -> Optional[Dict[str, Any]]:
+    token = get_spotify_access_token()
+    if not token:
+        return None
+
+    try:
+        resp = requests.get(
+            SPOTIFY_SEARCH_URL,
+            params={"q": query, "type": "track", "limit": 1},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            print("Spotify search failed:", resp.status_code, resp.text)
+            return None
+
+        items = resp.json().get("tracks", {}).get("items", [])
+        if not items:
+            return None
+
+        track = items[0]
+        return {
+            "title": track["name"],
+            "artist": ", ".join(a["name"] for a in track["artists"]),
+            "spotify_url": track["external_urls"]["spotify"],
+            "thumbnail_url": track["album"]["images"][0]["url"]
+            if track["album"]["images"]
+            else None,
+        }
+
+    except Exception as e:
+        print("Spotify search error:", e)
+        return None
 
 
-def simple_fuzzy_ratio(a: str, b: str) -> int:
-    a_norm = normalize_text(a)
-    b_norm = normalize_text(b)
-    if not a_norm or not b_norm:
-        return 0
-    matches = 0
-    for ch in set(a_norm):
-        matches += min(a_norm.count(ch), b_norm.count(ch))
-    max_len = max(len(a_norm), len(b_norm))
-    if max_len == 0:
-        return 0
-    return int((matches / max_len) * 100)
-
-
-def contains_unwanted_version(text: str) -> bool:
-    lowered = text.lower()
-    unwanted = ["live", "remix", "acoustic"]
-    return any(word in lowered for word in unwanted)
-
-
-def extract_query_from_input(user_input: str) -> str:
-    user_input = user_input.strip()
-    spotify_match = re.search(r"(https?://open\.spotify\.com/track/[^\s?]+)", user_input)
-    apple_match = re.search(r"(https?://music\.apple\.com/[^\s?]+)", user_input)
-    if spotify_match:
-        url = spotify_match.group(1)
-        try:
-            resp = requests.get(SPOTIFY_OEMBED_URL, params={"url": url}, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                title = data.get("title", "")
-                author = data.get("author_name", "")
-                combined = f"{title} {author}".strip()
-                if combined:
-                    return combined
-        except Exception:
-            pass
-    if apple_match:
-        url = apple_match.group(1)
-        slug = url.split("/")[-1]
-        slug = slug.split("?")[0]
-        slug = slug.replace("-", " ")
-        if slug:
-            return slug
-    return user_input
-
+# ============================================================
+# APPLE MUSIC FALLBACK (BING HTML)
+# ============================================================
 
 def bing_search_html(query: str) -> Optional[str]:
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        )
     }
-    params = {"q": query, "mkt": "en-US"}
     try:
-        resp = requests.get(BING_SEARCH_URL, params=params, headers=headers, timeout=10)
-        if resp.status_code == 200 and resp.text:
+        resp = requests.get(
+            BING_SEARCH_URL,
+            params={"q": query, "mkt": "en-US"},
+            headers=headers,
+            timeout=10,
+        )
+        if resp.status_code == 200:
             return resp.text
     except Exception:
         pass
     return None
 
 
-def extract_b_algo_blocks(html: str) -> List[str]:
-    blocks: List[str] = []
-    pattern = re.compile(r'<li class="b_algo".*?</li>', re.DOTALL)
-    for match in pattern.finditer(html):
-        blocks.append(match.group(0))
-    return blocks
-
-
-def extract_top_bing_title(html: str) -> Optional[str]:
-    blocks = extract_b_algo_blocks(html)
-    if not blocks:
-        return None
-    first = blocks[0]
-    m = re.search(r"<h2[^>]*>(.*?)</h2>", first, re.DOTALL | re.IGNORECASE)
-    if not m:
-        return None
-    raw = m.group(1)
-    text = re.sub(r"<.*?>", "", raw)
-    text = unescape(text).strip()
-    return text or None
-
-
-def split_bing_title(raw: str) -> Optional[Tuple[str, str]]:
-    text = unescape(raw)
-    seps = ["·", "–", "-", ":"]
-    for idx, ch in enumerate(text):
-        if ch in seps:
-            left = text[:idx].strip()
-            right = text[idx + 1 :].strip()
-            if re.search(r"[A-Za-z]", left) and re.search(r"[A-Za-z]", right):
-                return left, right
-    return None
-
-
-def looks_like_artist(part: str) -> bool:
-    lower = part.lower()
-    noise_words = ["official video", "lyrics", "topic", "hd", "remastered"]
-    if any(w in lower for w in noise_words):
-        return False
-    if "feat" in lower or "ft." in lower or "&" in part:
-        return True
-    words = part.split()
-    if len(words) >= 2:
-        return True
-    return False
-
-
-def parse_title_artist_from_bing_title(title: str, fallback_query: str) -> Tuple[str, str]:
-    split = split_bing_title(title)
-    if not split:
-        return fallback_query, ""
-    left, right = split
-    left_is_artist = looks_like_artist(left)
-    right_is_artist = looks_like_artist(right)
-    if left_is_artist and not right_is_artist:
-        artist = left
-        song = right
-    elif right_is_artist and not left_is_artist:
-        artist = right
-        song = left
-    else:
-        song = left
-        artist = right
-    return song.strip(), artist.strip()
-
-
-def extract_spotify_track_urls_from_html(html: str) -> List[str]:
-    blocks = extract_b_algo_blocks(html)
-    urls: List[str] = []
-    seen = set()
-    for block in blocks:
-        for m in re.finditer(r"https?://open\.spotify\.com/track/[a-zA-Z0-9]+", block):
-            url = m.group(0)
-            if url not in seen:
-                seen.add(url)
-                urls.append(url)
-    if not urls:
-        for m in re.finditer(r"https?://open\.spotify\.com/track/[a-zA-Z0-9]+", html):
-            url = m.group(0)
-            if url not in seen:
-                seen.add(url)
-                urls.append(url)
-    return urls
-
-
 def extract_apple_music_track_urls_from_html(html: str) -> List[str]:
-    blocks = extract_b_algo_blocks(html)
-    urls: List[str] = []
-    seen = set()
     pattern = re.compile(r"https?://music\.apple\.com/[^\s\"'<>]+")
-    for block in blocks:
-        for m in pattern.finditer(block):
-            url = m.group(0)
-            if "/album/" in url or "/playlist/" in url:
-                continue
-            if url not in seen:
-                seen.add(url)
-                urls.append(url)
-    if not urls:
-        for m in pattern.finditer(html):
-            url = m.group(0)
-            if "/album/" in url or "/playlist/" in url:
-                continue
-            if url not in seen:
-                seen.add(url)
-                urls.append(url)
+    urls = []
+    seen = set()
+
+    for m in pattern.finditer(html):
+        url = m.group(0)
+        if "/album/" in url or "/playlist/" in url:
+            continue
+        if url not in seen:
+            seen.add(url)
+            urls.append(url)
+
     return urls
-
-
-def spotify_oembed_metadata(url: str) -> Optional[Dict[str, Any]]:
-    try:
-        resp = requests.get(SPOTIFY_OEMBED_URL, params={"url": url}, timeout=10)
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        return data
-    except Exception:
-        return None
-
-
-def parse_spotify_title_and_artist(oembed_data: Dict[str, Any]) -> Tuple[str, str]:
-    title = oembed_data.get("title", "")
-    author = oembed_data.get("author_name", "")
-    return title, author
-
-
-def score_spotify_candidate(query: str, title: str, artist: str) -> Tuple[int, bool]:
-    full = f"{title} {artist}".strip()
-    ratio = simple_fuzzy_ratio(query, full)
-    unwanted = contains_unwanted_version(title)
-    return ratio, unwanted
-
-
-def find_best_spotify_track(query: str) -> Optional[Dict[str, Any]]:
-    html = bing_search_html(query)
-    if html is None:
-        return None
-    bing_title = extract_top_bing_title(html)
-    if bing_title:
-        song_title, artist = parse_title_artist_from_bing_title(bing_title, query)
-        if artist:
-            search_phrase = f"{song_title} {artist}"
-        else:
-            search_phrase = song_title
-    else:
-        search_phrase = query
-    html2 = bing_search_html(f"{search_phrase} site:open.spotify.com/track")
-    if html2 is None:
-        return None
-    urls = extract_spotify_track_urls_from_html(html2)
-    if not urls:
-        return None
-    best_data: Optional[Dict[str, Any]] = None
-    best_score = -1
-    for url in urls:
-        meta = spotify_oembed_metadata(url)
-        if not meta:
-            continue
-        title, artist = parse_spotify_title_and_artist(meta)
-        score, unwanted = score_spotify_candidate(search_phrase, title, artist)
-        if unwanted:
-            continue
-        if score > best_score:
-            best_score = score
-            best_data = {
-                "spotify_url": url,
-                "title": title,
-                "artist": artist,
-                "thumbnail_url": meta.get("thumbnail_url"),
-                "provider_url": meta.get("provider_url"),
-            }
-    if best_data is None:
-        return None
-    if best_score < 50:
-        return None
-    return best_data
 
 
 def find_apple_music_track(query: str) -> Optional[str]:
     html = bing_search_html(f"{query} site:{APPLE_MUSIC_DOMAIN}")
-    if html is None:
+    if not html:
         return None
+
     urls = extract_apple_music_track_urls_from_html(html)
-    if not urls:
-        return None
-    return urls[0]
+    return urls[0] if urls else None
 
 
-def load_ratings() -> Dict[str, Any]:
-    data = load_json(RATINGS_FILE)
-    if not isinstance(data, dict):
-        return {}
-    return data
+# ============================================================
+# DATABASE HELPERS
+# ============================================================
+
+async def db_get_song(song_key: str) -> Optional[asyncpg.Record]:
+    async with db_pool.acquire() as conn:
+        try:
+            return await conn.fetchrow(
+                "SELECT * FROM songs WHERE song_key=$1", song_key
+            )
+        except Exception as e:
+            print("DB GET SONG ERROR:", e)
+            return None
 
 
-def save_ratings(data: Dict[str, Any]) -> None:
-    save_json(RATINGS_FILE, data)
+async def db_upsert_song(song_key: str, title: str, artist: str,
+                         spotify_url: str, apple_url: Optional[str]):
+    async with db_pool.acquire() as conn:
+        try:
+            await conn.execute("""
+                INSERT INTO songs (song_key, title, artist, spotify_url, apple_url)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (song_key)
+                DO UPDATE SET apple_url = COALESCE(songs.apple_url, EXCLUDED.apple_url);
+            """, song_key, title, artist, spotify_url, apple_url)
+        except Exception as e:
+            print("DB UPSERT SONG ERROR:", e)
 
 
-def load_views() -> Dict[str, Any]:
-    data = load_json(VIEWS_FILE)
-    if not isinstance(data, dict):
-        data = {}
-    if "messages" not in data or not isinstance(data["messages"], list):
-        data["messages"] = []
-    return data
+async def db_set_rating(song_key: str, user_id: str, rating: int):
+    async with db_pool.acquire() as conn:
+        try:
+            await conn.execute("""
+                INSERT INTO ratings (song_key, user_id, rating)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (song_key, user_id)
+                DO UPDATE SET rating = EXCLUDED.rating;
+            """, song_key, user_id, rating)
+        except Exception as e:
+            print("DB SET RATING ERROR:", e)
 
 
-def save_views(data: Dict[str, Any]) -> None:
-    save_json(VIEWS_FILE, data)
+async def db_get_ratings(song_key: str) -> List[asyncpg.Record]:
+    async with db_pool.acquire() as conn:
+        try:
+            return await conn.fetch(
+                "SELECT * FROM ratings WHERE song_key=$1", song_key
+            )
+        except Exception as e:
+            print("DB GET RATINGS ERROR:", e)
+            return []
 
 
-def compute_average_and_count(ratings: Dict[str, int]) -> Tuple[float, int]:
-    if not ratings:
-        return 0.0, 0
-    total = sum(ratings.values())
-    count = len(ratings)
-    return total / count, count
+async def db_update_song_stats(song_key: str, average: float, count: int):
+    async with db_pool.acquire() as conn:
+        try:
+            await conn.execute("""
+                UPDATE songs
+                SET average=$2, count=$3
+                WHERE song_key=$1;
+            """, song_key, average, count)
+        except Exception as e:
+            print("DB UPDATE SONG STATS ERROR:", e)
 
 
-def build_song_key(spotify_url: str) -> str:
-    return spotify_url
+async def db_add_view(channel_id: int, message_id: int, song_key: str):
+    async with db_pool.acquire() as conn:
+        try:
+            await conn.execute("""
+                INSERT INTO views (channel_id, message_id, song_key)
+                VALUES ($1, $2, $3);
+            """, channel_id, message_id, song_key)
+        except Exception as e:
+            print("DB ADD VIEW ERROR:", e)
 
 
-def build_song_embed(
-    title: str,
-    artist: str,
-    spotify_url: str,
-    apple_url: Optional[str],
-    average: float,
-    count: int,
-) -> discord.Embed:
-    desc_parts = [f"**{title}**", f"by {artist}"]
-    desc = " — ".join(desc_parts)
-    embed = discord.Embed(title="Recommended Track", description=desc, color=0x1DB954)
+async def db_get_views() -> List[asyncpg.Record]:
+    async with db_pool.acquire() as conn:
+        try:
+            return await conn.fetch("SELECT * FROM views")
+        except Exception as e:
+            print("DB GET VIEWS ERROR:", e)
+            return []
+# ============================================================
+# EMBEDS & UI
+# ============================================================
+
+def build_song_embed(title: str, artist: str, spotify_url: str,
+                     apple_url: Optional[str], average: float, count: int):
+    desc = f"**{title}** — {artist}"
+    embed = discord.Embed(
+        title="Recommended Track",
+        description=desc,
+        color=0x1DB954,
+    )
     embed.add_field(name="Spotify", value=spotify_url, inline=False)
     if apple_url:
         embed.add_field(name="Apple Music", value=apple_url, inline=False)
+
     if count > 0:
         embed.add_field(
             name="Rating",
@@ -351,250 +318,410 @@ def build_song_embed(
         )
     else:
         embed.add_field(name="Rating", value="No ratings yet", inline=False)
+
     return embed
 
 
 class RatingView(discord.ui.View):
-    def __init__(self, song_key: str, timeout: Optional[float] = None) -> None:
+    def __init__(self, song_key: str, timeout: Optional[float] = None):
         super().__init__(timeout=timeout)
         self.song_key = song_key
 
-    async def handle_rating(
-        self, interaction: discord.Interaction, rating_value: int
-    ) -> None:
+    async def handle_rating(self, interaction: discord.Interaction, rating_value: int):
         user_id = str(interaction.user.id)
-        ratings_data = load_ratings()
-        song = ratings_data.get(self.song_key)
+
+        await db_set_rating(self.song_key, user_id, rating_value)
+        ratings = await db_get_ratings(self.song_key)
+
+        if not ratings:
+            avg = 0.0
+            count = 0
+        else:
+            values = [r["rating"] for r in ratings]
+            avg = sum(values) / len(values)
+            count = len(values)
+
+        await db_update_song_stats(self.song_key, avg, count)
+
+        song = await db_get_song(self.song_key)
         if not song:
             await interaction.response.send_message(
-                "This song is no longer available for rating.", ephemeral=True
+                "This song is no longer available.", ephemeral=True
             )
             return
-        song_ratings = song.get("ratings", {})
-        song_ratings[user_id] = rating_value
-        avg, count = compute_average_and_count(song_ratings)
-        song["ratings"] = song_ratings
-        song["average"] = avg
-        song["count"] = count
-        ratings_data[self.song_key] = song
-        save_ratings(ratings_data)
-        title = song.get("title", "Unknown")
-        artist = song.get("artist", "Unknown")
-        spotify_url = song.get("spotify_url", "")
-        apple_url = song.get("apple_url")
+
         embed = build_song_embed(
-            title=title,
-            artist=artist,
-            spotify_url=spotify_url,
-            apple_url=apple_url,
-            average=avg,
-            count=count,
+            song["title"],
+            song["artist"],
+            song["spotify_url"],
+            song["apple_url"],
+            avg,
+            count,
         )
+
         try:
             await interaction.response.edit_message(embed=embed, view=self)
         except discord.InteractionResponded:
             await interaction.edit_original_response(embed=embed, view=self)
 
-    @discord.ui.button(label="1", style=discord.ButtonStyle.secondary, row=0)
-    async def rate_1(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
+    @discord.ui.button(label="1", style=discord.ButtonStyle.secondary)
+    async def rate_1(self, interaction, button):
         await self.handle_rating(interaction, 1)
 
-    @discord.ui.button(label="2", style=discord.ButtonStyle.secondary, row=0)
-    async def rate_2(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
+    @discord.ui.button(label="2", style=discord.ButtonStyle.secondary)
+    async def rate_2(self, interaction, button):
         await self.handle_rating(interaction, 2)
 
-    @discord.ui.button(label="3", style=discord.ButtonStyle.secondary, row=0)
-    async def rate_3(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
+    @discord.ui.button(label="3", style=discord.ButtonStyle.secondary)
+    async def rate_3(self, interaction, button):
         await self.handle_rating(interaction, 3)
 
-    @discord.ui.button(label="4", style=discord.ButtonStyle.secondary, row=0)
-    async def rate_4(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
+    @discord.ui.button(label="4", style=discord.ButtonStyle.secondary)
+    async def rate_4(self, interaction, button):
         await self.handle_rating(interaction, 4)
 
-    @discord.ui.button(label="5", style=discord.ButtonStyle.primary, row=0)
-    async def rate_5(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
+    @discord.ui.button(label="5", style=discord.ButtonStyle.primary)
+    async def rate_5(self, interaction, button):
         await self.handle_rating(interaction, 5)
 
 
-async def restore_persistent_views() -> None:
+# ============================================================
+# RESTORE PERSISTENT VIEWS
+# ============================================================
+
+async def restore_persistent_views():
     await bot.wait_until_ready()
-    views_data = load_views()
-    messages = views_data.get("messages", [])
-    for entry in messages:
+    rows = await db_get_views()
+
+    for row in rows:
+        channel = bot.get_channel(row["channel_id"])
+        if not channel or not isinstance(channel, discord.TextChannel):
+            continue
+
         try:
-            channel_id = entry.get("channel_id")
-            message_id = entry.get("message_id")
-            song_key = entry.get("song_key")
-            if channel_id is None or message_id is None or song_key is None:
-                continue
-            channel = bot.get_channel(channel_id)
-            if channel is None or not isinstance(channel, discord.TextChannel):
-                continue
-            try:
-                await channel.fetch_message(message_id)
-            except discord.Forbidden:
-                continue
-            except discord.HTTPException:
-                continue
-            view = RatingView(song_key=song_key, timeout=None)
-            bot.add_view(view, message_id=message_id)
+            await channel.fetch_message(row["message_id"])
         except Exception:
-            pass
+            continue
+
+        view = RatingView(song_key=row["song_key"], timeout=None)
+        bot.add_view(view, message_id=row["message_id"])
 
 
-@bot.event
-async def on_ready() -> None:
-    try:
-        await bot.tree.sync()
-    except Exception:
-        pass
-    bot.loop.create_task(restore_persistent_views())
-
+# ============================================================
+# COMMANDS
+# ============================================================
 
 @bot.tree.command(name="recommend", description="Recommend a song by name or link.")
 @app_commands.describe(query="Song name or link")
-async def recommend(interaction: discord.Interaction, query: str) -> None:
+async def recommend(interaction: discord.Interaction, query: str):
     await interaction.response.defer()
-    extracted_query = extract_query_from_input(query)
-    spotify_data = find_best_spotify_track(extracted_query)
+
+    spotify_data = spotify_search_track(query)
     if not spotify_data:
-        await interaction.followup.send(
-            "I couldn't find a suitable Spotify track for that query."
-        )
+        await interaction.followup.send("I couldn't find a Spotify track for that query.")
         return
+
     title = spotify_data["title"]
     artist = spotify_data["artist"]
     spotify_url = spotify_data["spotify_url"]
+
     apple_url = find_apple_music_track(f"{title} {artist}")
-    song_key = build_song_key(spotify_url)
-    ratings_data = load_ratings()
-    song_entry = ratings_data.get(song_key)
-    if not song_entry:
-        song_entry = {
-            "title": title,
-            "artist": artist,
-            "spotify_url": spotify_url,
-            "apple_url": apple_url,
-            "ratings": {},
-            "average": 0.0,
-            "count": 0,
-        }
-    else:
-        if apple_url and not song_entry.get("apple_url"):
-            song_entry["apple_url"] = apple_url
-    avg = song_entry.get("average", 0.0)
-    count = song_entry.get("count", 0)
-    embed = build_song_embed(
-        title=title,
-        artist=artist,
-        spotify_url=spotify_url,
-        apple_url=apple_url,
-        average=avg,
-        count=count,
-    )
+
+    song_key = spotify_url
+
+    await db_upsert_song(song_key, title, artist, spotify_url, apple_url)
+
+    song = await db_get_song(song_key)
+    avg = song["average"]
+    count = song["count"]
+
+    embed = build_song_embed(title, artist, spotify_url, apple_url, avg, count)
     view = RatingView(song_key=song_key, timeout=None)
+
     msg = await interaction.followup.send(embed=embed, view=view)
-    ratings_data[song_key] = song_entry
-    save_ratings(ratings_data)
-    views_data = load_views()
-    messages = views_data.get("messages", [])
-    messages.append(
-        {
-            "channel_id": msg.channel.id,
-            "message_id": msg.id,
-            "song_key": song_key,
-        }
-    )
-    views_data["messages"] = messages
-    save_views(views_data)
+    await db_add_view(msg.channel.id, msg.id, song_key)
 
 
 @bot.tree.command(name="myratings", description="Show songs you have rated.")
-async def myratings(interaction: discord.Interaction) -> None:
+async def myratings(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
+
     user_id = str(interaction.user.id)
-    ratings_data = load_ratings()
-    entries: List[Tuple[str, Dict[str, Any]]] = []
-    for song_key, song in ratings_data.items():
-        song_ratings = song.get("ratings", {})
-        if user_id in song_ratings:
-            entries.append((song_key, song))
-    if not entries:
-        await interaction.followup.send(
-            "You haven't rated any songs yet.", ephemeral=True
-        )
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT s.*, r.rating
+            FROM ratings r
+            JOIN songs s ON s.song_key = r.song_key
+            WHERE r.user_id=$1
+            ORDER BY s.title
+            LIMIT 20;
+        """, user_id)
+
+    if not rows:
+        await interaction.followup.send("You haven't rated any songs yet.", ephemeral=True)
         return
-    lines: List[str] = []
-    for _, song in entries[:20]:
-        title = song.get("title", "Unknown")
-        artist = song.get("artist", "Unknown")
-        spotify_url = song.get("spotify_url", "")
-        song_ratings = song.get("ratings", {})
-        avg, count = compute_average_and_count(song_ratings)
-        user_rating = song_ratings.get(user_id, 0)
-        line = (
-            f"**{title}** — {artist}\n"
-            f"Your rating: {user_rating}/5 | Avg: {avg:.2f}/5 ({count})\n"
-            f"{spotify_url}"
+
+    lines = []
+    for row in rows:
+        lines.append(
+            f"**{row['title']}** — {row['artist']}\n"
+            f"Your rating: {row['rating']}/5 | Avg: {row['average']:.2f}/5 ({row['count']})\n"
+            f"{row['spotify_url']}"
         )
-        lines.append(line)
-    desc = "\n\n".join(lines)
+
     embed = discord.Embed(
         title="Your Ratings",
-        description=desc,
+        description="\n\n".join(lines),
         color=0x1DB954,
     )
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="leaderboard", description="Show top rated songs.")
-async def leaderboard(interaction: discord.Interaction) -> None:
+async def leaderboard(interaction: discord.Interaction):
     await interaction.response.defer()
-    ratings_data = load_ratings()
-    scored: List[Tuple[float, int, Dict[str, Any]]] = []
-    for _, song in ratings_data.items():
-        song_ratings = song.get("ratings", {})
-        avg, count = compute_average_and_count(song_ratings)
-        if count == 0:
-            continue
-        scored.append((avg, count, song))
-    if not scored:
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT *
+            FROM songs
+            WHERE count > 0
+            ORDER BY average DESC, count DESC
+            LIMIT 10;
+        """)
+
+    if not rows:
         await interaction.followup.send("No rated songs yet.")
         return
-    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    lines: List[str] = []
-    for idx, (avg, count, song) in enumerate(scored[:10], start=1):
-        title = song.get("title", "Unknown")
-        artist = song.get("artist", "Unknown")
-        spotify_url = song.get("spotify_url", "")
-        line = (
-            f"**#{idx}** — **{title}** — {artist}\n"
-            f"Avg: {avg:.2f}/5 ({count})\n"
-            f"{spotify_url}"
+
+    lines = []
+    for idx, row in enumerate(rows, start=1):
+        lines.append(
+            f"**#{idx}** — **{row['title']}** — {row['artist']}\n"
+            f"Avg: {row['average']:.2f}/5 ({row['count']})\n"
+            f"{row['spotify_url']}"
         )
-        lines.append(line)
-    desc = "\n\n".join(lines)
+
     embed = discord.Embed(
         title="Top Rated Songs",
-        description=desc,
+        description="\n\n".join(lines),
         color=0x1DB954,
     )
     await interaction.followup.send(embed=embed)
+# ============================================================
+# EXTRA COMMANDS
+# ============================================================
+
+@bot.tree.command(name="search", description="Search Spotify and show multiple results.")
+@app_commands.describe(query="Song name to search")
+async def search(interaction: discord.Interaction, query: str):
+    await interaction.response.defer()
+
+    token = get_spotify_access_token()
+    if not token:
+        await interaction.followup.send("Spotify authentication failed.")
+        return
+
+    resp = requests.get(
+        SPOTIFY_SEARCH_URL,
+        params={"q": query, "type": "track", "limit": 5},
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=10,
+    )
+
+    if resp.status_code != 200:
+        await interaction.followup.send("Spotify search failed.")
+        return
+
+    items = resp.json().get("tracks", {}).get("items", [])
+    if not items:
+        await interaction.followup.send("No results found.")
+        return
+
+    lines = []
+    for idx, track in enumerate(items, start=1):
+        title = track["name"]
+        artist = ", ".join(a["name"] for a in track["artists"])
+        url = track["external_urls"]["spotify"]
+        lines.append(f"**{idx}. {title}** — {artist}\n{url}")
+
+    embed = discord.Embed(
+        title=f"Search results for: {query}",
+        description="\n\n".join(lines),
+        color=0x1DB954,
+    )
+
+    await interaction.followup.send(embed=embed)
 
 
-if __name__ == "__main__":
+@bot.tree.command(name="artist", description="Show top tracks for an artist.")
+@app_commands.describe(name="Artist name")
+async def artist(interaction: discord.Interaction, name: str):
+    await interaction.response.defer()
+
+    token = get_spotify_access_token()
+    if not token:
+        await interaction.followup.send("Spotify authentication failed.")
+        return
+
+    resp = requests.get(
+        SPOTIFY_SEARCH_URL,
+        params={"q": name, "type": "artist", "limit": 1},
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=10,
+    )
+
+    items = resp.json().get("artists", {}).get("items", [])
+    if not items:
+        await interaction.followup.send("Artist not found.")
+        return
+
+    artist_data = items[0]
+    artist_id = artist_data["id"]
+    artist_name = artist_data["name"]
+
+    top_resp = requests.get(
+        f"https://api.spotify.com/v1/artists/{artist_id}/top-tracks",
+        params={"market": "US"},
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=10,
+    )
+
+    tracks = top_resp.json().get("tracks", [])
+    if not tracks:
+        await interaction.followup.send("No top tracks found.")
+        return
+
+    lines = []
+    for idx, t in enumerate(tracks[:10], start=1):
+        title = t["name"]
+        url = t["external_urls"]["spotify"]
+        lines.append(f"**{idx}. {title}**\n{url}")
+
+    embed = discord.Embed(
+        title=f"Top Tracks — {artist_name}",
+        description="\n\n".join(lines),
+        color=0x1DB954,
+    )
+
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="album", description="Show tracks from an album.")
+@app_commands.describe(name="Album name")
+async def album(interaction: discord.Interaction, name: str):
+    await interaction.response.defer()
+
+    token = get_spotify_access_token()
+    if not token:
+        await interaction.followup.send("Spotify authentication failed.")
+        return
+
+    resp = requests.get(
+        SPOTIFY_SEARCH_URL,
+        params={"q": name, "type": "album", "limit": 1},
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=10,
+    )
+
+    items = resp.json().get("albums", {}).get("items", [])
+    if not items:
+        await interaction.followup.send("Album not found.")
+        return
+
+    album_data = items[0]
+    album_id = album_data["id"]
+    album_name = album_data["name"]
+    album_url = album_data["external_urls"]["spotify"]
+
+    tracks_resp = requests.get(
+        f"https://api.spotify.com/v1/albums/{album_id}/tracks",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=10,
+    )
+
+    tracks = tracks_resp.json().get("items", [])
+    if not tracks:
+        await interaction.followup.send("No tracks found.")
+        return
+
+    lines = []
+    for idx, t in enumerate(tracks, start=1):
+        title = t["name"]
+        lines.append(f"**{idx}. {title}**")
+
+    embed = discord.Embed(
+        title=f"Album — {album_name}",
+        description="\n".join(lines),
+        color=0x1DB954,
+    )
+    embed.add_field(name="Spotify", value=album_url, inline=False)
+
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="random", description="Get a random popular track.")
+async def random_track(interaction: discord.Interaction):
+    await interaction.response.defer()
+
+    token = get_spotify_access_token()
+    if not token:
+        await interaction.followup.send("Spotify authentication failed.")
+        return
+
+    import random
+    genres = ["pop", "rock", "rap", "edm", "indie", "metal", "country", "rnb"]
+    genre = random.choice(genres)
+
+    resp = requests.get(
+        SPOTIFY_SEARCH_URL,
+        params={"q": f"genre:{genre}", "type": "track", "limit": 50},
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=10,
+    )
+
+    items = resp.json().get("tracks", {}).get("items", [])
+    if not items:
+        await interaction.followup.send("No tracks found.")
+        return
+
+    track = random.choice(items)
+
+    title = track["name"]
+    artist = ", ".join(a["name"] for a in track["artists"])
+    url = track["external_urls"]["spotify"]
+
+    embed = discord.Embed(
+        title="Random Track",
+        description=f"**{title}** — {artist}\nGenre: {genre}",
+        color=0x1DB954,
+    )
+    embed.add_field(name="Spotify", value=url, inline=False)
+
+    await interaction.followup.send(embed=embed)
+
+
+# ============================================================
+# BOT STARTUP
+# ============================================================
+
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user}")
+    try:
+        await bot.tree.sync()
+    except Exception as e:
+        print("Slash sync error:", e)
+
+    bot.loop.create_task(restore_persistent_views())
+
+
+async def main():
+    await init_db()
+
     token = os.getenv("DISCORD_TOKEN") or os.getenv("TOKEN")
     if not token:
-        print("No DISCORD_TOKEN or TOKEN environment variable found. Exiting.")
+        print("No DISCORD_TOKEN found.")
         sys.exit(1)
-    bot.run(token)
+
